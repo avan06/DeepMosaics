@@ -49,7 +49,7 @@ def imwrite(file_path,img,use_thread=False):
         if system_type == 'Linux':
             cv2.imwrite(file_path, img)
         else:
-            cv2.imencode('.jpg', img)[1].tofile(file_path)
+            cv2.imencode('.png', img)[1].tofile(file_path)
     if use_thread:
         t = Thread(target=subfun,args=(file_path, img,))
         t.daemon()
@@ -57,21 +57,21 @@ def imwrite(file_path,img,use_thread=False):
     else:
         subfun(file_path,img)
 
-def resize(img,size,interpolation=cv2.INTER_LINEAR):
+def resize(img: cv2.typing.MatLike, size, interpolation=cv2.INTER_LINEAR):
     '''
-    cv2.INTER_NEAREST      最邻近插值点法
-    cv2.INTER_LINEAR        双线性插值法
-    cv2.INTER_AREA         邻域像素再取样插补
-    cv2.INTER_CUBIC        双立方插补，4*4大小的补点
-    cv2.INTER_LANCZOS4     8x8像素邻域的Lanczos插值
+    cv2.INTER_NEAREST      Nearest-neighbor interpolation
+    cv2.INTER_LINEAR       Bilinear interpolation
+    cv2.INTER_AREA         Resampling with pixel neighborhood
+    cv2.INTER_CUBIC        Bicubic interpolation with 4x4 sampling points
+    cv2.INTER_LANCZOS4     Lanczos interpolation with an 8x8 pixel neighborhood
     '''
     h, w = img.shape[:2]
     if np.min((w,h)) ==size:
         return img
     if w >= h:
-        res = cv2.resize(img,(int(size*w/h), size),interpolation=interpolation)
+        res = cv2.resize(img, (int(size*w/h), size), interpolation=interpolation)
     else:
-        res = cv2.resize(img,(size, int(size*h/w)),interpolation=interpolation)
+        res = cv2.resize(img, (size, int(size*h/w)), interpolation=interpolation)
     return res
 
 def resize_like(img,img_like):
@@ -126,7 +126,7 @@ def makedataset(target_image,orgin_image):
     img[0:256,0:256] = target_image[0:256,int(w/2-256/2):int(w/2+256/2)]
     img[0:256,256:512] = orgin_image[0:256,int(w/2-256/2):int(w/2+256/2)]
     return img
-    
+
 def find_mostlikely_ROI(mask):
     contours,hierarchy=cv2.findContours(mask, cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)
     if len(contours)>0:
@@ -138,7 +138,50 @@ def find_mostlikely_ROI(mask):
         mask = cv2.fillPoly(mask,[contours[index]],(255))
     return mask
 
-def boundingSquare(mask,Ex_mul):
+def boundingSquare(mask, Ex_mul):
+    """
+    Calculate the center, bounding box size, and expansion of the mosaic mask region.
+    """
+    # Calculate the region area
+    area = cv2.countNonZero(mask)
+    if area == 0:
+        return 0, 0, 0, 0
+
+    # Call the encapsulated bounding box calculation function
+    h, w = mask.shape[:2]
+    x, y, size = compute_bounding_box(mask, Ex_mul, h, w)
+
+    # Call the coordinate adjustment function to ensure the result is within image bounds
+    x, y = adjust_coordinates(x, y, size, h, w)
+
+    # Return the result
+    half_size = size // 2
+    return x + half_size, y + half_size, half_size, area
+
+def compute_bounding_box(mask, Ex_mul, h, w):
+    """
+    Calculate the expanded bounding box of the mask and adjust it based on Ex_mul.
+    """
+    # Calculate the bounding box of the mask
+    x, y, width, height = cv2.boundingRect(mask)
+    center_x = x + width // 2
+    center_y = y + height // 2
+
+    # Determine the size of the bounding box
+    size = max(width, height) * Ex_mul
+    size = min(size, min(h, w))  # Ensure it does not exceed the image dimensions
+
+    return center_x - size // 2, center_y - size // 2, int(size)
+
+def adjust_coordinates(x, y, size, h, w):
+    """
+    Adjust the bounding box position to ensure it is within the image boundaries.
+    """
+    x = np.clip(x, 0, w - size)
+    y = np.clip(y, 0, h - size)
+    return x, y
+
+def boundingSquare_old(mask,Ex_mul):
     # thresh = mask_threshold(mask,10,threshold)
     area = mask_area(mask)
     if area == 0 :
@@ -192,7 +235,59 @@ def mask_area(mask):
         area = 0
     return area
 
-def replace_mosaic(img_origin,img_fake,mask,x,y,size,no_feather):
+def replace_mosaic(img_origin, img_fake, mask, x, y, size, no_feather, enable_dynamic_blur=False, base_ksize=5, gradient_scale=1.0):
+    # Resize the mosaic area
+    img_fake = cv2.resize(img_fake, (size * 2, size * 2), interpolation=cv2.INTER_CUBIC)
+    
+    if no_feather:
+        # Directly replace without transition processing
+        img_origin[y - size:y + size, x - size:x + size] = img_fake
+        return img_origin
+    else:
+        # Dynamic blur
+        if enable_dynamic_blur:
+            eclosion_num = dynamic_blur(mask, mask, base_ksize=base_ksize, gradient_scale=gradient_scale)
+        else:
+            eclosion_num = int(size / 10) + 2  # Default blur kernel size
+
+        # Pre-scale and crop the mask
+        mask_crop = cv2.resize(mask, (img_origin.shape[1], img_origin.shape[0]))[y - size:y + size, x - size:x + size]
+        mask_crop = cv2.merge([mask_crop, mask_crop, mask_crop])  # Add channel dimensions
+
+        # Apply blur to the mask
+        mask_crop = cv2.blur(mask_crop, (eclosion_num, eclosion_num)) if not enable_dynamic_blur else mask_crop
+        mask_crop = mask_crop / 255.0
+        
+        # Composite the image
+        img_crop = img_origin[y - size:y + size, x - size:x + size]
+        img_origin[y - size:y + size, x - size:x + size] = np.clip(
+            (img_crop * (1 - mask_crop) + img_fake * mask_crop), 0, 255
+        ).astype('uint8')
+
+        return img_origin
+
+def replace_mosaic_1(img_origin, img_fake, mask, x, y, size, no_feather):
+    img_fake = cv2.resize(img_fake, (size * 2, size * 2), interpolation=cv2.INTER_CUBIC)
+    if no_feather:
+        img_origin[y - size:y + size, x - size:x + size] = img_fake
+        return img_origin
+    
+    # Pre-scale the mask and crop it
+    mask_crop = mask[y - size:y + size, x - size:x + size]
+    mask_crop = cv2.blur(mask_crop, (int(size / 10) + 2, int(size / 10) + 2))
+    mask_crop = mask_crop.astype(np.float32) / 255.0
+    
+    # Blend the images
+    mask_crop = mask_crop[..., None]  # Add a channel dimension to avoid repeatedly using ch_one2three
+    img_crop = img_origin[y - size:y + size, x - size:x + size].astype(np.float32)
+    img_fake = img_fake.astype(np.float32)
+    img_origin[y - size:y + size, x - size:x + size] = np.clip(
+        img_crop * (1 - mask_crop) + img_fake * mask_crop, 0, 255
+    ).astype('uint8')
+    
+    return img_origin
+
+def replace_mosaic_old(img_origin,img_fake,mask,x,y,size,no_feather):
     img_fake = cv2.resize(img_fake,(size*2,size*2),interpolation=cv2.INTER_CUBIC)
     if no_feather:
         img_origin[y-size:y+size,x-size:x+size]=img_fake
@@ -251,3 +346,37 @@ def splice(imgs,splice_shape):
                 cnt += 1
     return output
 
+def dynamic_blur(mask, image, base_ksize=5, gradient_scale=1.0):
+    # Calculate the average gradient
+    avg_gradient = calculate_average_gradient(mask)
+
+    # Dynamically adjust blur parameters
+    ksize = max(base_ksize, int(avg_gradient * gradient_scale))  # Adjust the blur kernel size based on the gradient
+    ksize = ksize if ksize % 2 == 1 else ksize + 1  # Ensure the kernel size is an odd number
+
+    # Apply blurring
+    blurred_image = cv2.GaussianBlur(image, (ksize, ksize), 0)
+    return blurred_image
+
+def calculate_average_gradient(mask):
+    # Find the mask boundary
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boundary_mask = np.zeros_like(mask)
+    cv2.drawContours(boundary_mask, contours, -1, 255, thickness=1)  # Draw the boundary
+
+    # Compute gradients
+    gradient_magnitude = calculate_gradient(mask)
+
+    # Extract gradient values only in the boundary region
+    boundary_gradient = gradient_magnitude[boundary_mask == 255]
+
+    # Calculate the average gradient
+    average_gradient = np.mean(boundary_gradient) if len(boundary_gradient) > 0 else 0
+    return average_gradient
+
+def calculate_gradient(mask):
+    # Use Sobel operator to compute gradients
+    sobelx = cv2.Sobel(mask, cv2.CV_64F, 1, 0, ksize=3)  # Gradient in the x-direction
+    sobely = cv2.Sobel(mask, cv2.CV_64F, 0, 1, ksize=3)  # Gradient in the y-direction
+    gradient_magnitude = np.sqrt(sobelx**2 + sobely**2)  # Gradient magnitude
+    return gradient_magnitude

@@ -5,11 +5,12 @@ import util.image_processing as impro
 from util import mosaic
 from util import data
 import torch
+import torch.nn as nn
 import numpy as np
 
-def run_segment(img,net,size = 360,gpu_id = '-1'):
-    img = impro.resize(img,size)
-    img = data.im2tensor(img,gpu_id = gpu_id, bgr2rgb = False, is0_1 = True)
+def run_segment(img: cv2.typing.MatLike, net:nn.Module, size = 360, gpu_id = '-1'):
+    img = impro.resize(img, size)
+    img = data.im2tensor(img, gpu_id = gpu_id, bgr2rgb = False, is0_1 = True)
     mask = net(img)
     mask = data.tensor2im(mask, gray=True, is0_1 = True)
     return mask
@@ -68,7 +69,32 @@ def get_ROI_position(img,net,opt,keepsize=True):
     x,y,halfsize,area = impro.boundingSquare(mask, 1)
     return mask,x,y,halfsize,area
 
-def get_mosaic_position(img_origin,net_mosaic_pos,opt):
+def get_mosaic_position(img_origin: cv2.typing.MatLike, net_mosaic_pos: nn.Module, opt):
+    # Original image dimensions
+    h, w = img_origin.shape[:2]
+    # Mask is generated on the scaled-down image
+    mask = run_segment(img_origin, net_mosaic_pos, size=360, gpu_id=opt.gpu_id)
+
+    # Calculate ex_mun based on the scaled-down dimensions
+    ex_mun = int(360 / 20)  # Fixed size of 360 as the calculation basis
+    mask = impro.mask_threshold(mask, ex_mun=ex_mun, threshold=opt.mask_threshold)
+
+    if not opt.all_mosaic_area:
+        mask = impro.find_mostlikely_ROI(mask)
+    
+    # Compute mosaic regions
+    x, y, size, area = impro.boundingSquare(mask, Ex_mul=opt.ex_mult)
+    
+    # Adjust position and size based on the scaling ratio
+    rat = min(h, w) / 360.0  # Scaling ratio
+    x, y, size = int(rat * x), int(rat * y), int(rat * size)
+    x, y = np.clip(x, 0, w), np.clip(y, 0, h)
+    size = np.clip(size, 0, min(w - x, h - y))
+    # print(x, y, size, area)
+    
+    return x, y, size, mask
+
+def get_mosaic_position_old(img_origin,net_mosaic_pos,opt):
     h,w = img_origin.shape[:2]
     mask = run_segment(img_origin,net_mosaic_pos,size=360,gpu_id = opt.gpu_id)
     # mask_1 = mask.copy()
@@ -83,3 +109,34 @@ def get_mosaic_position(img_origin,net_mosaic_pos,opt):
     size = np.clip(size, 0, min(w-x,h-y))
     # print(x,y,size)
     return x,y,size,mask
+
+def get_all_mosaic_positions(img_origin: cv2.typing.MatLike, net_mosaic_pos: nn.Module, opt):
+    # Original image dimensions
+    h, w = img_origin.shape[:2]
+    # Mask is generated on the scaled-down image
+    mask = run_segment(img_origin, net_mosaic_pos, size=360, gpu_id=opt.gpu_id)
+    
+    ex_mun = int(360 / 20)  # Calculated based on the scaling ratio to 360x360
+    mask = impro.mask_threshold(mask, ex_mun=ex_mun, threshold=opt.mask_threshold)
+
+    # Retrieve contours of all continuous regions
+    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    mosaic_regions = []
+    
+    for contour in contours:
+        # Mask expansion calculation
+        mask_single = np.zeros_like(mask)
+        mask_single = cv2.fillPoly(mask_single, [contour], (255))
+
+        # Compute mosaic regions
+        x, y, size, area = impro.boundingSquare(mask_single, Ex_mul=opt.ex_mult)
+        
+        # Adjust position and size based on the scaling ratio
+        rat = min(h, w) / 360.0  # Scaling ratio
+        x, y, size = int(rat * x), int(rat * y), int(rat * size)
+        x, y = np.clip(x, 0, w), np.clip(y, 0, h)
+        size = np.clip(size, 0, min(w - x, h - y))
+
+        mosaic_regions.append((x, y, size, mask_single))
+    
+    return mosaic_regions

@@ -46,7 +46,7 @@ def tensor2im(image_tensor, gray=False, rgb2bgr = True ,is0_1 = False, batch_ind
     return image_numpy.astype(np.uint8)
 
 
-def im2tensor(image_numpy, gray=False,bgr2rgb = True, reshape = True, gpu_id = '-1',is0_1 = False):
+def im2tensor(image_numpy: cv2.typing.MatLike, gray=False,bgr2rgb = True, reshape = True, gpu_id = '-1',is0_1 = False):
     if gray:
         h, w = image_numpy.shape
         image_numpy = (image_numpy/255.0-0.5)/0.5

@@ -34,7 +34,7 @@ def main():
             util.clean_tempfiles(opt, tmp_init = False)
 
     elif opt.mode == 'clean':
-        netM = loadmodel.bisenet(opt,'mosaic')
+        netM = loadmodel.bisenet(opt, 'mosaic')
         if opt.traditional:
             netG = None
         elif opt.netG == 'video':
@@ -45,12 +45,12 @@ def main():
         for file in files:
             opt.media_path = file
             if util.is_img(file):
-                clean.cleanmosaic_img(opt,netG,netM)
+                clean.cleanmosaic_img(opt, netG, netM)
             elif util.is_video(file):
                 if opt.netG == 'video' and not opt.traditional:            
-                    clean.cleanmosaic_video_fusion(opt,netG,netM)
+                    clean.cleanmosaic_video_fusion(opt, netG, netM)
                 else:
-                    clean.cleanmosaic_video_byframe(opt,netG,netM)
+                    clean.cleanmosaic_video_byframe(opt, netG, netM)
                 util.clean_tempfiles(opt, tmp_init = False)
             else:
                 print('This type of file is not supported')
@@ -60,9 +60,9 @@ def main():
         for file in files:
             opt.media_path = file
             if util.is_img(file):
-                style.styletransfer_img(opt,netG)
+                style.styletransfer_img(opt, netG)
             elif util.is_video(file):
-                style.styletransfer_video(opt,netG)
+                style.styletransfer_video(opt, netG)
                 util.clean_tempfiles(opt, tmp_init = False)
             else:
                 print('This type of file is not supported')

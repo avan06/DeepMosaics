@@ -3,6 +3,7 @@ import time
 import numpy as np
 import cv2
 import torch
+import torch.nn as nn
 from models import runmodel
 from util import data,util,ffmpeg,filt
 from util import image_processing as impro
@@ -13,7 +14,108 @@ from threading import Thread
 '''
 ---------------------Clean Mosaic---------------------
 '''
-def get_mosaic_positions(opt,netM,imagepaths,savemask=True):
+def get_mosaic_positions(opt, netM: nn.Module, imagepaths: list[str], savemask=True):
+    positions = []
+    resume_frame = 0
+    continue_flag = False
+    
+    # Step 1: Resume Check
+    step, pre_positions = resume_check(opt)
+    if step and step['step'] > 2:
+        return pre_positions
+    if step and step['step'] >= 2 and step['frame'] > 0:
+        resume_frame = step['frame']
+        continue_flag = True
+        positions = pre_positions.tolist()
+        imagepaths = imagepaths[resume_frame:]
+
+    print('Step: 2/4 -- Find mosaic locations')
+    start_time = time.time()
+
+    # Step 2: Setup Thread for Image Loading
+    img_read_pool = Queue(maxsize=4)
+    Thread(target=image_loader, args=(imagepaths, img_read_pool, opt.temp_dir)).start()
+
+    # Step 3: Process Images
+    for i, imagepath in enumerate(imagepaths, start=1):
+        img_origin = img_read_pool.get()
+        x, y, size, mask = runmodel.get_mosaic_position(img_origin, netM, opt)
+        positions.append([x, y, size])
+
+        # Save mask in a thread
+        if savemask:
+            Thread(target=cv2.imwrite, args=(os.path.join(opt.temp_dir, 'mosaic_mask', imagepath), mask)).start()
+
+        # Periodic Save
+        if i % 1000 == 0:
+            save_progress(positions, opt.temp_dir, step, continue_flag, pre_positions, i + resume_frame)
+
+        # Preview Result
+        if not opt.no_preview:
+            preview_mask(mask)
+
+        # Display Progress
+        print_progress(i, len(imagepaths), start_time)
+
+    # Step 4: Cleanup
+    finalize_preview(opt.no_preview)
+    print("\nOptimize mosaic locations...")
+    positions = finalize_positions(positions, pre_positions, continue_flag, opt.medfilt_num)
+    save_final_step(positions, opt.temp_dir)
+
+    return positions
+
+# Helper Functions
+def resume_check(opt):
+    step = None
+    pre_positions = None
+    step_path = os.path.join(opt.temp_dir, 'step.json')
+    positions_path = os.path.join(opt.temp_dir, 'mosaic_positions.npy')
+
+    if os.path.isfile(step_path):
+        step = util.loadjson(step_path)
+        if os.path.isfile(positions_path):
+            pre_positions = np.load(positions_path)
+    return step, pre_positions
+
+def image_loader(imagepaths, img_read_pool, temp_dir):
+    for imagepath in imagepaths:
+        img_origin = impro.imread(os.path.join(temp_dir, 'video2image', imagepath))
+        img_read_pool.put(img_origin)
+
+def save_progress(positions, temp_dir, step, continue_flag, pre_positions, frame):
+    save_positions = np.array(positions)
+    if continue_flag:
+        save_positions = np.concatenate((pre_positions, save_positions), axis=0)
+    np.save(os.path.join(temp_dir, 'mosaic_positions.npy'), save_positions)
+    util.savejson(os.path.join(temp_dir, 'step.json'), {'step': 2, 'frame': frame})
+
+def preview_mask(mask):
+    cv2.imshow('mosaic mask', mask)
+    cv2.waitKey(1)
+
+def print_progress(current, total, start_time):
+    elapsed_time = time.time() - start_time
+    print(f'\r {current}/{total} | Elapsed: {elapsed_time:.2f}s', end='')
+
+def finalize_preview(no_preview):
+    if not no_preview:
+        cv2.destroyAllWindows()
+
+def finalize_positions(positions, pre_positions, continue_flag, medfilt_num):
+    positions = np.array(positions)
+    if continue_flag:
+        positions = np.concatenate((pre_positions, positions), axis=0)
+    for i in range(3):
+        positions[:, i] = filt.medfilt(positions[:, i], medfilt_num)
+    return positions
+
+
+def save_final_step(positions, temp_dir):
+    util.savejson(os.path.join(temp_dir, 'step.json'), {'step': 3, 'frame': 0})
+    np.save(os.path.join(temp_dir, 'mosaic_positions.npy'), positions)
+
+def get_mosaic_positions_old(opt, netM: nn.Module, imagepaths: list[str], savemask=True):
     # resume
     continue_flag = False
     if os.path.isfile(os.path.join(opt.temp_dir,'step.json')):
@@ -47,7 +149,7 @@ def get_mosaic_positions(opt,netM,imagepaths,savemask=True):
         x,y,size,mask = runmodel.get_mosaic_position(img_origin,netM,opt)
         positions.append([x,y,size])
         if savemask:
-            t = Thread(target=cv2.imwrite,args=(os.path.join(opt.temp_dir+'/mosaic_mask',imagepath), mask,))
+            t = Thread(target=cv2.imwrite, args=(os.path.join(opt.temp_dir+'/mosaic_mask', imagepath), mask,))
             t.start()
         if i%1000==0:
             save_positions = np.array(positions)
@@ -77,8 +179,35 @@ def get_mosaic_positions(opt,netM,imagepaths,savemask=True):
 
     return positions
 
-def cleanmosaic_img(opt,netG,netM):
+def cleanmosaic_img(opt, netG:nn.Module, netM:nn.Module):
+    path = opt.media_path
+    print('Clean Mosaic:', path)
+    img_origin:cv2.typing.MatLike = impro.imread(path)
+    
+    # Step 1: Retrieve all mosaic regions
+    mosaic_regions = runmodel.get_all_mosaic_positions(img_origin, netM, opt)  # Returns multiple (x, y, size, mask)
+    img_result = img_origin.copy()
 
+    # Step 2: Process each region one by one
+    for x, y, size, mask in mosaic_regions:
+        if size > 100:  # Ensure the region size is sufficient for processing
+            img_mosaic = img_origin[y - size:y + size, x - size:x + size]
+            
+            if opt.traditional:
+                img_fake = runmodel.traditional_cleaner(img_mosaic, opt)
+            else:
+                img_fake = runmodel.run_pix2pix(img_mosaic, netG, opt)
+            
+            # Replace the current mosaic region
+            img_result = impro.replace_mosaic(img_result, img_fake, mask, x, y, size, opt.no_feather)
+        else:
+            print(f'Skipped mosaic region at ({x}, {y}) with insufficient size({size})')
+    
+    # Step 3: Save the result image
+    output_path = os.path.join(opt.result_dir, os.path.splitext(os.path.basename(path))[0] + '_clean.png')
+    impro.imwrite(output_path, img_result)
+
+def cleanmosaic_img_old(opt,netG:nn.Module,netM:nn.Module):
     path = opt.media_path
     print('Clean Mosaic:',path)
     img_origin = impro.imread(path)
@@ -94,9 +223,9 @@ def cleanmosaic_img(opt,netG,netM):
         img_result = impro.replace_mosaic(img_origin,img_fake,mask,x,y,size,opt.no_feather)
     else:
         print('Do not find mosaic')
-    impro.imwrite(os.path.join(opt.result_dir,os.path.splitext(os.path.basename(path))[0]+'_clean.jpg'),img_result)
+    impro.imwrite(os.path.join(opt.result_dir,os.path.splitext(os.path.basename(path))[0]+'_clean.png'),img_result)
 
-def cleanmosaic_img_server(opt,img_origin,netG,netM):
+def cleanmosaic_img_server(opt,img_origin,netG:nn.Module,netM:nn.Module):
     x,y,size,mask = runmodel.get_mosaic_position(img_origin,netM,opt)
     img_result = img_origin.copy()
     if size > 100 :
@@ -108,11 +237,11 @@ def cleanmosaic_img_server(opt,img_origin,netG,netM):
         img_result = impro.replace_mosaic(img_origin,img_fake,mask,x,y,size,opt.no_feather)
     return img_result
 
-def cleanmosaic_video_byframe(opt,netG,netM):
+def cleanmosaic_video_byframe(opt,netG:nn.Module,netM:nn.Module):
     path = opt.media_path
     fps,imagepaths,height,width = video_init(opt,path)
     start_frame = int(imagepaths[0][7:13])
-    positions = get_mosaic_positions(opt,netM,imagepaths,savemask=True)[(start_frame-1):]
+    positions = get_mosaic_positions(opt, netM, imagepaths, savemask=True)[(start_frame-1):]
 
     t1 = time.time()
     if not opt.no_preview:
@@ -155,7 +284,7 @@ def cleanmosaic_video_byframe(opt,netG,netM):
                 opt.temp_dir+'/voice_tmp.mp3',
                  os.path.join(opt.result_dir,os.path.splitext(os.path.basename(path))[0]+'_clean.mp4'))  
 
-def cleanmosaic_video_fusion(opt,netG,netM):
+def cleanmosaic_video_fusion(opt,netG:nn.Module,netM:nn.Module):
     path = opt.media_path
     N,T,S = 2,5,3
     LEFT_FRAME = (N*S)
@@ -168,7 +297,7 @@ def cleanmosaic_video_fusion(opt,netG,netM):
     
     fps,imagepaths,height,width = video_init(opt,path)
     start_frame = int(imagepaths[0][7:13])
-    positions = get_mosaic_positions(opt,netM,imagepaths,savemask=True)[(start_frame-1):]
+    positions = get_mosaic_positions(opt, netM, imagepaths, savemask=True)[(start_frame-1):]
     t1 = time.time()
     if not opt.no_preview:
         cv2.namedWindow('clean', cv2.WINDOW_NORMAL)

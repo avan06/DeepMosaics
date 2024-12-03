@@ -1,7 +1,11 @@
-opencv_python==4.5.1.48
-numpy==1.19.3
-torchvision==0.8.2
-torch==1.7.1
-matplotlib==3.3.2
-tensorboardX==2.2
-scikit-image==0.17.2
+opencv_python==4.10.0.84
+numpy==2.0.2
+
+torch==2.5.0+cu124; sys_platform != 'darwin'
+torchvision==0.20.0+cu124; sys_platform != 'darwin'
+torch==2.5.0; sys_platform == 'darwin'
+torchvision==0.20.0; sys_platform == 'darwin'
+
+matplotlib
+tensorboardX==2.6
+scikit-image==0.22.0
